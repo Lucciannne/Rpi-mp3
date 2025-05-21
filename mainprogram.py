@@ -11,7 +11,7 @@ from luma.oled.device import ssd1306
 # ──────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────────────
-MUSIC_DIR = "/home/fran/music"
+MUSIC_DIR = os.path.expanduser("~/music")  # Use absolute path
 I2C_ADDRESS = 0x3C
 BUTTONS = {
     'play': 11,   # BOARD pin 11
@@ -20,12 +20,11 @@ BUTTONS = {
 }
 FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 DISPLAY_CONFIG = {
-    'track_font_size': 40,
+    'main_font_size': 48,
     'meta_font_size': 14,
-    'progress_height': 4,
-    'padding': 5,
+    'padding': 5
 }
-DEBOUNCE_MS = 200
+DEBOUNCE_MS = 300
 
 # Initialize logging
 logging.basicConfig(
@@ -39,7 +38,6 @@ class MPDController:
     def __init__(self):
         self.client = MPDClient()
         self.client.timeout = 10
-        self.client.idletimeout = None
         self.playlist_name = "alltracks"
         
     def connect(self):
@@ -52,49 +50,50 @@ class MPDController:
 
     def initialize_playlist(self):
         try:
+            # Verify music directory exists
+            if not os.path.isdir(MUSIC_DIR):
+                raise FileNotFoundError(f"Music directory not found: {MUSIC_DIR}")
+
             # Clear existing data
             self.client.clear()
             logger.debug("Cleared current playlist")
 
-            # Update database with correct path
+            # Update database
             logger.debug(f"Updating database for {MUSIC_DIR}")
-            self.client.update(MUSIC_DIR)  # Use full path
-            
+            self.client.update(os.path.basename(MUSIC_DIR))
+
             # Wait for update completion
-            while True:
-                status = self.client.status()
-                if 'updating_db' not in status:
-                    break
+            while 'updating_db' in self.client.status():
                 logger.debug("Database update in progress...")
                 time.sleep(1)
 
-            # Add files using proper URI format
-            logger.debug(f"Adding files from {MUSIC_DIR}")
-            self.client.add(f"file://{MUSIC_DIR}")  # Use file:// URI
-            
-            # Handle playlist creation
+            # Add files to playlist
+            logger.debug("Adding files to playlist")
+            self.client.add("/")  # Add root of MPD's music directory
+
+            # Handle playlist
             playlists = [p['playlist'] for p in self.client.listplaylists()]
             if self.playlist_name in playlists:
                 self.client.rm(self.playlist_name)
             self.client.save(self.playlist_name)
-            
+
             # Load and start playback
             self.client.load(self.playlist_name)
             self.client.play(0)
             self.client.pause()
-            logger.info("Playback initialized with first track")
+            logger.info("Playback initialized successfully")
 
         except Exception as e:
             logger.error(f"Playlist initialization failed: {e}")
             raise
-            
+
 class DisplayManager:
     def __init__(self):
         self.serial = i2c(port=1, address=I2C_ADDRESS)
         self.device = ssd1306(self.serial)
         self.fonts = {
-            'main': ImageFont.truetype(FONT_PATH, 48),
-            'meta': ImageFont.truetype(FONT_PATH, 14)
+            'main': ImageFont.truetype(FONT_PATH, DISPLAY_CONFIG['main_font_size']),
+            'meta': ImageFont.truetype(FONT_PATH, DISPLAY_CONFIG['meta_font_size'])
         }
         logger.info("OLED display initialized")
 
@@ -102,33 +101,35 @@ class DisplayManager:
         img = Image.new("1", self.device.size)
         draw = ImageDraw.Draw(img)
         
-        # Main track number (big and centered)
-        main_text = f"{current_pos + 1}"
+        # Main track number
+        track_no = current_pos + 1
+        main_text = f"{track_no}"
         bbox = draw.textbbox((0,0), main_text, font=self.fonts['main'])
         x = (self.device.width - (bbox[2]-bbox[0])) // 2
         y = (self.device.height - (bbox[3]-bbox[1])) // 3
         draw.text((x, y), main_text, font=self.fonts['main'], fill=255)
         
-        # Track counter (bottom center)
-        counter_text = f"{current_pos + 1} / {total_tracks}"
+        # Track counter
+        counter_text = f"{track_no} / {total_tracks}"
         bbox = draw.textbbox((0,0), counter_text, font=self.fonts['meta'])
         x = (self.device.width - (bbox[2]-bbox[0])) // 2
-        y = self.device.height - (bbox[3]-bbox[1]) - 5
+        y = self.device.height - (bbox[3]-bbox[1]) - DISPLAY_CONFIG['padding']
         draw.text((x, y), counter_text, font=self.fonts['meta'], fill=255)
         
-        # Play state indicator (top right)
+        # Play state
         state_icon = "▶" if state == "play" else "⏸"
         bbox = draw.textbbox((0,0), state_icon, font=self.fonts['meta'])
-        x = self.device.width - (bbox[2]-bbox[0]) - 5
-        draw.text((x, 5), state_icon, font=self.fonts['meta'], fill=255)
+        x = self.device.width - (bbox[2]-bbox[0]) - DISPLAY_CONFIG['padding']
+        draw.text((x, DISPLAY_CONFIG['padding']), state_icon, 
+                 font=self.fonts['meta'], fill=255)
         
         return img
 
 class ButtonHandler:
-    def __init__(self, mpd_controller, display_manager):
-        self.mpd = mpd_controller
-        self.display = display_manager
-        self.last_press = 0
+    def __init__(self, mpd, display):
+        self.mpd = mpd
+        self.display = display
+        self.last_press = time.time()
         
     def handle_playpause(self, channel):
         if self._debounce(): return
@@ -140,7 +141,7 @@ class ButtonHandler:
             else:
                 self.mpd.client.play()
                 logger.debug("Started playback")
-            self._update_display()
+            self.update_display()
         except Exception as e:
             logger.error(f"Play/pause error: {e}")
 
@@ -148,31 +149,32 @@ class ButtonHandler:
         if self._debounce(): return
         try:
             status = self.mpd.client.status()
-            current_pos = int(status.get('song', 0))
-            total_tracks = int(status.get('playlistlength', 0))
+            current = int(status.get('song', 0))
+            total = int(status.get('playlistlength', 0))
             
             if direction == 'next':
-                if current_pos < total_tracks - 1:
+                if current < total - 1:
                     self.mpd.client.next()
                     logger.debug("Next track")
                 else:
-                    logger.debug("Already at last track")
+                    logger.debug("End of playlist")
             elif direction == 'prev':
-                self.mpd.client.previous()
-                logger.debug("Previous track")
+                if current > 0:
+                    self.mpd.client.previous()
+                    logger.debug("Previous track")
             
-            self._update_display()
+            self.update_display()
         except Exception as e:
             logger.error(f"Skip error: {e}")
 
     def _debounce(self):
         now = time.time()
-        if now - self.last_press < DEBOUNCE_MS/1000:
+        if (now - self.last_press) < (DEBOUNCE_MS / 1000):
             return True
         self.last_press = now
         return False
 
-    def _update_display(self):
+    def update_display(self):
         try:
             status = self.mpd.client.status()
             current_pos = int(status.get('song', 0))
@@ -185,12 +187,12 @@ class ButtonHandler:
                 state=state
             )
             self.display.device.display(frame)
-            logger.debug(f"Display updated - Pos: {current_pos+1} State: {state}")
         except Exception as e:
             logger.error(f"Display update failed: {e}")
-            
+
 def main():
     try:
+        # Initialize components
         mpd = MPDController()
         display = DisplayManager()
         mpd.connect()
@@ -198,29 +200,40 @@ def main():
         
         handler = ButtonHandler(mpd, display)
         
+        # Setup GPIO
         GPIO.setmode(GPIO.BOARD)
         GPIO.setup(BUTTONS['play'], GPIO.IN, pull_up_down=GPIO.PUD_UP)
         GPIO.setup(BUTTONS['prev'], GPIO.IN, pull_up_down=GPIO.PUD_UP)
         GPIO.setup(BUTTONS['next'], GPIO.IN, pull_up_down=GPIO.PUD_UP)
         
-        GPIO.add_event_detect(BUTTONS['play'], GPIO.FALLING, 
-                            callback=handler.handle_playpause, bouncetime=DEBOUNCE_MS)
+        # Add event detection
+        GPIO.add_event_detect(BUTTONS['play'], GPIO.FALLING,
+                            callback=handler.handle_playpause,
+                            bouncetime=DEBOUNCE_MS)
         GPIO.add_event_detect(BUTTONS['prev'], GPIO.FALLING,
-                            callback=lambda x: handler.handle_skip('prev'), bouncetime=DEBOUNCE_MS)
+                            callback=lambda x: handler.handle_skip('prev'),
+                            bouncetime=DEBOUNCE_MS)
         GPIO.add_event_detect(BUTTONS['next'], GPIO.FALLING,
-                            callback=lambda x: handler.handle_skip('next'), bouncetime=DEBOUNCE_MS)
+                            callback=lambda x: handler.handle_skip('next'),
+                            bouncetime=DEBOUNCE_MS)
         
-        logger.info("System ready - starting main loop")
+        logger.info("System ready. Starting main loop...")
+        
+        # Main loop
         while True:
-            handler._update_display()
+            handler.update_display()
             time.sleep(0.5)
             
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+    except Exception as e:
+        logger.critical(f"Fatal error: {e}", exc_info=True)
     finally:
         GPIO.cleanup()
-        mpd.client.close()
-        mpd.client.disconnect()
+        if mpd.client:
+            mpd.client.close()
+            mpd.client.disconnect()
+        logger.info("Cleanup complete")
 
 if __name__ == "__main__":
     main()
