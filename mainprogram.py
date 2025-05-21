@@ -28,11 +28,7 @@ font   = None
 def scan_and_load():
     """Builds a fresh playlist of all audio files under MUSIC_DIR."""
     client.clear()
-    for root, _, files in os.walk(MUSIC_DIR):
-        for fn in sorted(files):
-            if fn.lower().endswith((".mp3", ".flac", ".wav", ".ogg", ".m4a")):
-                path = os.path.join(root, fn)
-                client.add(path)
+    client.load('alltracks')
     client.play(0)
     client.pause()  # start paused
 
