@@ -3,10 +3,10 @@ import time
 import os
 import RPi.GPIO as GPIO
 from mpd import MPDClient
-import adafruit_ssd1306
-import board
-import busio
-from PIL import Image, ImageDraw, ImageFont
+from luma.core.interface.serial import i2c
+from luma.core.render import canvas
+from luma.oled.device import ssd1306
+from PIL import ImageFont
 
 # Define GPIO pins for buttons
 PLAY_PAUSE_BTN = 11
@@ -35,21 +35,13 @@ class MP3Player:
         self.mpd_client.timeout = 10
         self.mpd_client.connect(MPD_HOST, MPD_PORT)
         
-        # Initialize I2C for OLED display
-        self.i2c = busio.I2C(board.SCL, board.SDA)
-        self.oled = adafruit_ssd1306.SSD1306_I2C(OLED_WIDTH, OLED_HEIGHT, self.i2c, addr=OLED_ADDR)
+        # Initialize OLED display with luma.oled
+        serial = i2c(port=1, address=OLED_ADDR)
+        self.device = ssd1306(serial, width=OLED_WIDTH, height=OLED_HEIGHT)
         
-        # Clear display
-        self.oled.fill(0)
-        self.oled.show()
-        
-        # Load font for display
+        # Load fonts for display
         self.font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 24)
         self.small_font = ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', 12)
-        
-        # Create an image buffer for PIL to draw on
-        self.image = Image.new('1', (OLED_WIDTH, OLED_HEIGHT))
-        self.draw = ImageDraw.Draw(self.image)
         
         # Initialize button states
         self.last_play_pause_state = GPIO.input(PLAY_PAUSE_BTN)
@@ -60,9 +52,6 @@ class MP3Player:
         self.update_display()
     
     def update_display(self):
-        # Clear the image buffer
-        self.draw.rectangle((0, 0, OLED_WIDTH, OLED_HEIGHT), outline=0, fill=0)
-        
         # Get current status
         status = self.mpd_client.status()
         song_info = self.mpd_client.currentsong()
@@ -71,26 +60,24 @@ class MP3Player:
         current_index = int(status.get('song', '0')) + 1 if 'song' in status else 0
         total_songs = status.get('playlistlength', '0')
         
-        # Draw the track index in large font
-        self.draw.text((10, 10), f"{current_index}/{total_songs}", font=self.font, fill=255)
-        
-        # Draw song title (if available) in smaller font
-        if 'title' in song_info:
-            title = song_info['title']
-            if len(title) > 15:
-                title = title[:15] + "..."
-            self.draw.text((10, 40), title, font=self.small_font, fill=255)
-        
-        # Draw play/pause status
-        state = status.get('state', 'stop')
-        if state == 'play':
-            self.draw.text((100, 10), "▶", font=self.font, fill=255)
-        elif state == 'pause':
-            self.draw.text((100, 10), "⏸", font=self.font, fill=255)
-        
-        # Display the image buffer on the OLED
-        self.oled.image(self.image)
-        self.oled.show()
+        # Draw on the display using luma.oled's canvas context manager
+        with canvas(self.device) as draw:
+            # Draw the track index in large font
+            draw.text((10, 10), f"{current_index}/{total_songs}", font=self.font, fill="white")
+            
+            # Draw song title (if available) in smaller font
+            if 'title' in song_info:
+                title = song_info['title']
+                if len(title) > 15:
+                    title = title[:15] + "..."
+                draw.text((10, 40), title, font=self.small_font, fill="white")
+            
+            # Draw play/pause status
+            state = status.get('state', 'stop')
+            if state == 'play':
+                draw.text((100, 10), "▶", font=self.font, fill="white")
+            elif state == 'pause':
+                draw.text((100, 10), "⏸", font=self.font, fill="white")
     
     def handle_play_pause(self):
         status = self.mpd_client.status()
@@ -172,8 +159,7 @@ class MP3Player:
             GPIO.cleanup()
             self.mpd_client.close()
             self.mpd_client.disconnect()
-            self.oled.fill(0)
-            self.oled.show()
+            self.device.clear()
 
 if __name__ == "__main__":
     player = MP3Player()
