@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import time
 import os
+import glob
 import RPi.GPIO as GPIO
-from mpd import MPDClient
+import vlc
 from luma.core.interface.serial import i2c
 from luma.core.render import canvas
 from luma.oled.device import ssd1306
@@ -13,10 +14,9 @@ PLAY_PAUSE_BTN = 11
 PREV_BTN = 13
 NEXT_BTN = 15
 
-# MPD Configuration
-MPD_HOST = "localhost"
-MPD_PORT = 6600
+# Music directory configuration
 MUSIC_DIR = "/home/fran/music"
+SUPPORTED_FORMATS = ['.mp3', '.flac', '.wav', '.ogg', '.m4a']
 
 # OLED Display Configuration
 OLED_WIDTH = 128
@@ -48,248 +48,197 @@ class MP3Player:
         with canvas(self.device) as draw:
             draw.text((10, 10), "Starting...", font=self.font, fill="white")
         
-        # Initialize MPD client and connect
-        self.mpd_client = MPDClient()
-        self.mpd_client.timeout = 10
-        self.mpd_client.idletimeout = None  # Don't timeout waiting for idle events
-        self.connect_mpd()
+        # Initialize VLC instance and player
+        self.vlc_instance = vlc.Instance('--no-xlib')
+        self.player = self.vlc_instance.media_player_new()
         
         # Initialize button states
         self.last_play_pause_state = GPIO.input(PLAY_PAUSE_BTN)
         self.last_prev_state = GPIO.input(PREV_BTN)
         self.last_next_state = GPIO.input(NEXT_BTN)
         
-        # Set up the playlist and position to the first track
-        self.setup_playlist()
+        # Track list and current position
+        self.tracks = []
+        self.current_track_index = 0
+        self.is_playing = False
         
-        # Update initial display
+        # Load tracks
+        self.load_tracks()
+        
+        # Set up initial track
+        if self.tracks:
+            self.set_track(0)
+        
+        # Update display with initial state
         self.update_display()
     
-    def connect_mpd(self):
-        """Connect to MPD server with error handling"""
+    def load_tracks(self):
+        """Load all music tracks from the music directory"""
         try:
-            self.mpd_client.connect(MPD_HOST, MPD_PORT)
-            print("Connected to MPD server")
-        except Exception as e:
-            print(f"Error connecting to MPD: {e}")
-            # Display error on OLED
-            with canvas(self.device) as draw:
-                draw.text((10, 10), "MPD Error", fill="white")
-                draw.text((10, 30), "Check MPD", fill="white")
-                draw.text((10, 45), "service", fill="white")
-            time.sleep(5)
-            exit(1)
-    
-    def setup_playlist(self):
-        """Set up the playlist with all tracks from the music directory"""
-        try:
-            # Show loading message
             with canvas(self.device) as draw:
                 draw.text((10, 10), "Loading", font=self.font, fill="white")
                 draw.text((10, 40), "music files...", font=self.small_font, fill="white")
             
-            # Clear the current playlist
-            self.mpd_client.clear()
+            self.tracks = []
             
-            # Update the MPD database to find all available music files
-            self.mpd_client.update()
+            # Find all music files with supported extensions
+            for extension in SUPPORTED_FORMATS:
+                pattern = os.path.join(MUSIC_DIR, f"*{extension}")
+                self.tracks.extend(glob.glob(pattern))
             
-            # Wait a moment for the database update to complete
-            time.sleep(2)
+            # Sort tracks alphabetically
+            self.tracks.sort()
             
-            # List all files in the music directory
-            files = self.mpd_client.listall()
-            
-            # Filter to only include MP3 files (or any music files MPD supports)
-            music_files = []
-            for item in files:
-                if 'file' in item and (item['file'].endswith('.mp3') or 
-                                       item['file'].endswith('.flac') or 
-                                       item['file'].endswith('.ogg') or
-                                       item['file'].endswith('.wav')):
-                    music_files.append(item['file'])
-            
-            # Sort files alphabetically for consistent ordering
-            music_files.sort()
-            
-            # Add each file to the playlist
-            for file in music_files:
-                self.mpd_client.add(file)
-            
-            # Check if any files were added
-            status = self.mpd_client.status()
-            playlist_length = int(status.get('playlistlength', 0))
-            
-            if playlist_length > 0:
-                # Stop any current playback
-                self.mpd_client.stop()
-                
-                # Position to the first track (index 0) without playing
-                self.mpd_client.playid(0)
-                self.mpd_client.pause(1)  # Pause immediately to prevent autoplay
-                
-                print(f"Loaded {playlist_length} tracks and positioned to first track")
-            else:
+            if not self.tracks:
                 print("No music files found")
                 with canvas(self.device) as draw:
                     draw.text((10, 10), "No music", font=self.font, fill="white")
                     draw.text((10, 40), f"Check: {MUSIC_DIR}", font=self.small_font, fill="white")
+            else:
+                track_count = len(self.tracks)
+                print(f"Loaded {track_count} tracks")
                 
         except Exception as e:
-            print(f"Error setting up playlist: {e}")
+            print(f"Error loading tracks: {e}")
             with canvas(self.device) as draw:
-                draw.text((10, 10), "Playlist Error", font=self.small_font, fill="white")
-                draw.text((10, 30), str(e)[:15], font=self.small_font, fill="white")
+                draw.text((10, 10), "Error:", font=self.small_font, fill="white")
+                draw.text((10, 25), str(e)[:20], font=self.small_font, fill="white")
+    
+    def set_track(self, index):
+        """Set the current track by index without playing"""
+        if not self.tracks:
+            return False
+        
+        # Ensure index is within bounds
+        if index < 0:
+            index = 0
+        elif index >= len(self.tracks):
+            index = len(self.tracks) - 1
+        
+        self.current_track_index = index
+        
+        # Create a new Media object
+        media = self.vlc_instance.media_new(self.tracks[index])
+        
+        # Set the media to the player
+        self.player.set_media(media)
+        
+        # Parse the media (this loads metadata)
+        media.parse()
+        
+        return True
+    
+    def play_pause(self):
+        """Toggle between play and pause"""
+        if not self.tracks:
+            return
+        
+        if self.player.is_playing():
+            self.player.pause()
+            self.is_playing = False
+        else:
+            self.player.play()
+            self.is_playing = True
+    
+    def get_track_name(self):
+        """Get the name of the current track"""
+        if not self.tracks or self.current_track_index >= len(self.tracks):
+            return "No track"
+        
+        # Get the track path
+        track_path = self.tracks[self.current_track_index]
+        
+        # Try to get metadata from VLC
+        media = self.player.get_media()
+        if media:
+            title = media.get_meta(vlc.Meta.Title)
+            if title:
+                return title
+        
+        # Fall back to filename if no metadata
+        return os.path.basename(track_path)
     
     def update_display(self):
         """Update the OLED display with current track info"""
         try:
-            # Get current status and song info
-            status = self.mpd_client.status()
-            playlist_length = int(status.get('playlistlength', 0))
+            total_tracks = len(self.tracks)
             
-            if playlist_length == 0:
-                # No tracks in playlist
+            if total_tracks == 0:
+                # No tracks loaded
                 with canvas(self.device) as draw:
                     draw.text((10, 10), "No tracks", font=self.font, fill="white")
                 return
             
-            # Get current track number (1-based for display)
-            current_song = int(status.get('song', 0)) + 1 if 'song' in status else 1
+            # Get current track info (1-based for display)
+            current_track_num = self.current_track_index + 1
+            track_name = self.get_track_name()
             
-            # Try to get current song info
-            try:
-                song_info = self.mpd_client.currentsong()
-            except:
-                song_info = {}
+            # Truncate track name if too long
+            if len(track_name) > 15:
+                track_name = track_name[:15] + "..."
             
             # Draw on the display
             with canvas(self.device) as draw:
                 # Draw track number / total tracks
-                draw.text((10, 10), f"{current_song}/{playlist_length}", font=self.font, fill="white")
+                draw.text((10, 10), f"{current_track_num}/{total_tracks}", font=self.font, fill="white")
                 
-                # Draw track title or filename
-                if 'title' in song_info:
-                    title = song_info['title']
-                    if len(title) > 15:
-                        title = title[:15] + "..."
-                    draw.text((10, 40), title, font=self.small_font, fill="white")
-                elif 'file' in song_info:
-                    # Use filename if title not available
-                    filename = os.path.basename(song_info['file'])
-                    if len(filename) > 15:
-                        filename = filename[:15] + "..."
-                    draw.text((10, 40), filename, font=self.small_font, fill="white")
+                # Draw track name
+                draw.text((10, 40), track_name, font=self.small_font, fill="white")
                 
-                # Draw play/pause/stop status
-                state = status.get('state', 'stop')
-                if state == 'play':
+                # Draw play/pause status
+                if self.is_playing:
                     draw.text((100, 10), "▶", font=self.font, fill="white")
-                elif state == 'pause':
-                    draw.text((100, 10), "⏸", font=self.font, fill="white")
                 else:
-                    draw.text((100, 10), "■", font=self.font, fill="white")
+                    draw.text((100, 10), "⏸", font=self.font, fill="white")
         
         except Exception as e:
             print(f"Display update error: {e}")
-            # Show error on display
             with canvas(self.device) as draw:
                 draw.text((10, 10), "Error:", font=self.small_font, fill="white")
                 draw.text((10, 25), str(e)[:20], font=self.small_font, fill="white")
     
     def handle_play_pause(self):
         """Handle play/pause button press"""
-        try:
-            status = self.mpd_client.status()
-            state = status.get('state', 'stop')
-            
-            # Check if there are songs in the playlist
-            if int(status.get('playlistlength', 0)) == 0:
-                print("No songs in playlist")
-                return
-            
-            if state == 'play':
-                # If playing, pause
-                self.mpd_client.pause(1)
-            else:
-                # If paused or stopped, play (resume)
-                self.mpd_client.pause(0)
-            
-            # Update display after state change
-            self.update_display()
-            
-        except Exception as e:
-            print(f"Play/pause error: {e}")
+        if not self.tracks:
+            with canvas(self.device) as draw:
+                draw.text((10, 10), "No tracks", font=self.font, fill="white")
+            return
+        
+        self.play_pause()
+        self.update_display()
     
     def handle_prev(self):
         """Handle previous track or rewind button press"""
-        try:
-            status = self.mpd_client.status()
-            state = status.get('state', 'stop')
-            
-            # Check if there are songs in the playlist
-            if int(status.get('playlistlength', 0)) == 0:
-                print("No songs in playlist")
-                return
-            
-            if state == 'play':
-                # If playing, rewind 15 seconds
-                current_time = float(status.get('elapsed', 0))
-                if current_time > 15:
-                    self.mpd_client.seekcur(current_time - 15)
-                else:
-                    self.mpd_client.seekcur(0)
+        if not self.tracks:
+            return
+        
+        if self.is_playing:
+            # If playing, rewind 15 seconds
+            current_time = self.player.get_time()
+            if current_time > 15000:  # VLC time is in milliseconds
+                self.player.set_time(current_time - 15000)
             else:
-                # If paused or stopped, go to previous track without playing
-                current_song = int(status.get('song', 0))
-                if current_song > 0:
-                    # Move to previous song
-                    self.mpd_client.previous()
-                    # Ensure it's paused
-                    self.mpd_client.pause(1)
-                else:
-                    # If at first track, stay there
-                    print("Already at first track")
-            
-            # Update display after track change
-            self.update_display()
-            
-        except Exception as e:
-            print(f"Previous track error: {e}")
+                self.player.set_time(0)
+        else:
+            # If paused, go to previous track
+            if self.current_track_index > 0:
+                self.set_track(self.current_track_index - 1)
+                self.update_display()
     
     def handle_next(self):
         """Handle next track or fast forward button press"""
-        try:
-            status = self.mpd_client.status()
-            state = status.get('state', 'stop')
-            
-            # Check if there are songs in the playlist
-            playlist_length = int(status.get('playlistlength', 0))
-            if playlist_length == 0:
-                print("No songs in playlist")
-                return
-            
-            if state == 'play':
-                # If playing, fast forward 15 seconds
-                current_time = float(status.get('elapsed', 0))
-                self.mpd_client.seekcur(current_time + 15)
-            else:
-                # If paused or stopped, go to next track without playing
-                current_song = int(status.get('song', 0))
-                if current_song < playlist_length - 1:
-                    # Move to next song
-                    self.mpd_client.next()
-                    # Ensure it's paused
-                    self.mpd_client.pause(1)
-                else:
-                    # If at last track, stay there
-                    print("Already at last track")
-            
-            # Update display after track change
-            self.update_display()
-            
-        except Exception as e:
-            print(f"Next track error: {e}")
+        if not self.tracks:
+            return
+        
+        if self.is_playing:
+            # If playing, fast forward 15 seconds
+            current_time = self.player.get_time()
+            self.player.set_time(current_time + 15000)
+        else:
+            # If paused, go to next track
+            if self.current_track_index < len(self.tracks) - 1:
+                self.set_track(self.current_track_index + 1)
+                self.update_display()
     
     def check_buttons(self):
         """Check button states and handle presses"""
@@ -311,41 +260,34 @@ class MP3Player:
             self.handle_next()
         self.last_next_state = current_next_state
     
-    def check_mpd_connection(self):
-        """Ensure MPD connection is still active"""
-        try:
-            self.mpd_client.ping()
-        except:
-            print("MPD connection lost, reconnecting...")
-            try:
-                self.mpd_client.disconnect()
-            except:
-                pass
-            self.connect_mpd()
-    
     def run(self):
         """Main loop to run the MP3 player"""
         try:
             print("MP3 Player running. Press Ctrl+C to exit.")
-            last_connection_check = time.time()
+            last_update_time = 0
             
             while True:
                 # Check and handle button presses
                 self.check_buttons()
                 
-                # Periodically check MPD connection
-                current_time = time.time()
-                if current_time - last_connection_check > 30:  # Check every 30 seconds
-                    self.check_mpd_connection()
-                    last_connection_check = current_time
-                
                 # Periodically update the display when playing
-                try:
-                    status = self.mpd_client.status()
-                    if status.get('state') == 'play' and int(time.time()) % 5 == 0:
+                current_time = time.time()
+                if self.is_playing and current_time - last_update_time >= 5:
+                    self.update_display()
+                    last_update_time = current_time
+                
+                # Check if track ended and play next one
+                if self.is_playing and not self.player.is_playing():
+                    print("Track ended")
+                    # Move to next track if available
+                    if self.current_track_index < len(self.tracks) - 1:
+                        self.set_track(self.current_track_index + 1)
+                        self.player.play()
                         self.update_display()
-                except Exception as e:
-                    print(f"Error getting MPD status: {e}")
+                    else:
+                        # At the end of the playlist
+                        self.is_playing = False
+                        self.update_display()
                 
                 # Small delay to prevent CPU hogging
                 time.sleep(0.1)
@@ -355,11 +297,7 @@ class MP3Player:
         finally:
             # Clean up
             GPIO.cleanup()
-            try:
-                self.mpd_client.close()
-                self.mpd_client.disconnect()
-            except:
-                pass
+            self.player.stop()
             self.device.clear()
 
 if __name__ == "__main__":
