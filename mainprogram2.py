@@ -29,7 +29,7 @@ DEBOUNCE_MS = 300
 UPDATE_INTERVAL = 0.5
 
 # Initialize logging
-typing.logger.basicConfig(
+logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
