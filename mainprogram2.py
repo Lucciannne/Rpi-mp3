@@ -44,15 +44,15 @@ class MPDController:
         self.client.connect("localhost", 6600)
         logger.info("Connected to MPD")
 
-    def init_playlist(self):
-        # Clear, update DB for MUSIC_DIR, add only that folder
+        def init_playlist(self):
+        # Clear and update entire MPD database
         self.client.clear()
-        self.client.update(os.path.basename(MUSIC_DIR))
+        self.client.update()
         # wait for updating
         while 'updating_db' in self.client.status():
             time.sleep(1)
-        # add exactly our directory
-        self.client.add(os.path.basename(MUSIC_DIR))
+        # Add all tracks from root of MPD's music directory
+        self.client.add('/')
         self.client.play(0)
         self.client.pause()
         logger.info("Playlist initialized")
