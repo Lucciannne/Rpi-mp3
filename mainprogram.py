@@ -1,173 +1,135 @@
+#!/usr/bin/env python3
 import os
 import time
-import signal
-from mpd import MPDClient, CommandError
+from mpd import MPDClient
 import RPi.GPIO as GPIO
+from PIL import Image, ImageDraw, ImageFont
 from luma.core.interface.serial import i2c
 from luma.oled.device import ssd1306
-from PIL import Image, ImageDraw, ImageFont
 
-# Configuration
-MUSIC_DIR = '/home/fran/music'
-I2C_PORT = 1
-OLED_ADDR = 0x3C
-BUTTON_PINS = {
-    'play_pause': 11,
-    'rewind': 13,
-    'forward': 15,
-}
-REWIND_SECONDS = 15
-FAST_FORWARD_SECONDS = 15
-FONT_PATH = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
-FONT_SIZE_TRACK = 48
-FONT_SIZE_STATE = 14
+# ──────────────────────────────────────────────────────────────────────────────
+# CONFIG
+MUSIC_DIR    = "/home/fran/music"
+I2C_ADDRESS  = 0x3C
+BUTTON_PLAY  = 11   # BOARD pin 11
+BUTTON_REW   = 13   # BOARD pin 13
+BUTTON_FFWD  = 15   # BOARD pin 15
+FONT_PATH    = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_SIZE    = 80
+DEBOUNCE_MS  = 200
+# ──────────────────────────────────────────────────────────────────────────────
 
-# Global state
-track_list = []
+# Globals
 client = None
-device = None
-font_track = None
-font_state = None
+oled   = None
+draw   = None
+font   = None
 
-
-def scan_music(directory):
-    """Recursively scan for music files and return sorted list."""
-    exts = ('.mp3', '.flac', '.wav', '.ogg', '.m4a')
-    files = []
-    for root, _, filenames in os.walk(directory):
-        for f in filenames:
-            if f.lower().endswith(exts):
-                files.append(os.path.join(root, f))
-    files.sort()
-    return files
-
+def scan_and_load():
+    """Builds a fresh playlist of all audio files under MUSIC_DIR."""
+    client.clear()
+    for root, _, files in os.walk(MUSIC_DIR):
+        for fn in sorted(files):
+            if fn.lower().endswith((".mp3", ".flac", ".wav", ".ogg", ".m4a")):
+                path = os.path.join(root, fn)
+                client.add(path)
+    client.play(0)
+    client.pause()  # start paused
 
 def init_mpd():
-    """Connect to MPD and load playlist."""
     global client
     client = MPDClient()
-    client.timeout = 10
-    client.idletimeout = None
-    client.connect('localhost', 6600)
-    client.clear()
-    # Add tracks
-    for f in track_list:
-        client.add(f)
-    # Start paused on first track
-    client.play(0)
-    client.pause()
-
+    client.connect("localhost", 6600)
+    scan_and_load()
 
 def init_oled():
-    """Initialize the OLED display."""
-    global device, font_track, font_state
-    serial = i2c(port=I2C_PORT, address=OLED_ADDR)
-    device = ssd1306(serial)
-    # Load fonts
-    try:
-        font_track = ImageFont.truetype(FONT_PATH, FONT_SIZE_TRACK)
-        font_state = ImageFont.truetype(FONT_PATH, FONT_SIZE_STATE)
-    except IOError:
-        font_track = ImageFont.load_default()
-        font_state = ImageFont.load_default()
+    global oled, draw, font
+    serial = i2c(port=1, address=I2C_ADDRESS)
+    oled   = ssd1306(serial)
+    font   = ImageFont.truetype(FONT_PATH, FONT_SIZE)
 
+def get_status():
+    st = client.status()
+    return st.get("state", "stop"), int(st.get("song", 0)), float(st.get("elapsed", 0))
 
-def update_display():
-    """Render current track number and play state on OLED."""
-    status = client.status()
-    track_idx = int(status.get('song', 0))
-    state = status.get('state', 'stop')
-    # Prepare image
-    img = Image.new('1', (device.width, device.height), "BLACK")
-    draw = ImageDraw.Draw(img)
-    # Track number (1-based)
-    track_str = str(track_idx + 1)
-    w, h = draw.textsize(track_str, font=font_track)
-    x = (device.width - w) // 2
-    y = 0
-    draw.text((x, y), track_str, font=font_track, fill=255)
-    # State text
-    state_str = state.upper()
-    w2, h2 = draw.textsize(state_str, font=font_state)
-    x2 = (device.width - w2) // 2
-    y2 = device.height - h2
-    draw.text((x2, y2), state_str, font=font_state, fill=255)
-    device.display(img)
+def update_oled():
+    state, song_idx, _ = get_status()
+    track_no = song_idx + 1
+    msg      = "▶" if state == "play" else "⏸"
+    # draw
+    img = Image.new("1", (oled.width, oled.height))
+    draw_local = ImageDraw.Draw(img)
+    # center the number
+    w, h = draw_local.textsize(str(track_no), font=font)
+    x = (oled.width - w) // 2
+    y = (oled.height - FONT_SIZE) // 2
+    draw_local.text((x, y), str(track_no), font=font, fill=255)
+    # play/pause icon bottom-right
+    draw_local.text((oled.width - FONT_SIZE//2 - 2, oled.height - FONT_SIZE//2 - 2),
+                    msg, font=ImageFont.truetype(FONT_PATH, FONT_SIZE//2), fill=255)
+    oled.display(img)
 
-
-def button_play_pause(channel):
-    """Toggle play/pause."""
-    try:
-        client.pause()
-        update_display()
-    except CommandError:
-        pass
-
-
-def button_rewind(channel):
-    """Rewind or previous track."""
-    status = client.status()
-    if status.get('state') == 'play':
-        song_idx = int(status.get('song', 0))
-        elapsed = float(status.get('elapsed', 0))
-        newpos = max(elapsed - REWIND_SECONDS, 0)
-        client.seek(song_idx, newpos)
+def btn_play_pause(channel):
+    state, _, _ = get_status()
+    if state == "play":
+        client.pause(1)
     else:
+        client.play()
+    update_oled()
+
+def btn_rewind_prev(channel):
+    state, _, elapsed = get_status()
+    if state == "play" and elapsed > 15:
+        client.seekcur(int(elapsed) - 15)
+    else:
+        was_playing = (state == "play")
         client.previous()
-    update_display()
+        if not was_playing:
+            client.pause(1)
+    update_oled()
 
-
-def button_forward(channel):
-    """Fast forward or next track."""
-    status = client.status()
-    if status.get('state') == 'play':
-        song_idx = int(status.get('song', 0))
-        elapsed = float(status.get('elapsed', 0))
-        newpos = elapsed + FAST_FORWARD_SECONDS
-        client.seek(song_idx, newpos)
+def btn_ffwd_next(channel):
+    state, _, elapsed = get_status()
+    # MPD doesn't support 'seekcur' beyond track length; so always next if paused
+    if state == "play":
+        # get length to check boundary
+        song = client.currentsong()
+        length = float(song.get("time", 0))
+        if elapsed + 15 < length:
+            client.seekcur(int(elapsed) + 15)
+        else:
+            client.next()
     else:
+        was_playing = False
         client.next()
-    update_display()
+        client.pause(1)
+    update_oled()
 
-
-def cleanup(signum, frame):
-    """Cleanup resources on exit."""
-    GPIO.cleanup()
-    if client:
-        try:
-            client.close()
-            client.disconnect()
-        except:
-            pass
-    device.clear()
-    exit(0)
-
+def init_gpio():
+    GPIO.setmode(GPIO.BOARD)
+    for pin, cb in ((BUTTON_PLAY, btn_play_pause),
+                    (BUTTON_REW,  btn_rewind_prev),
+                    (BUTTON_FFWD, btn_ffwd_next)):
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        GPIO.add_event_detect(pin, GPIO.FALLING,
+                              callback=cb, bouncetime=DEBOUNCE_MS)
 
 def main():
-    global track_list
-    # Scan music files
-    track_list = scan_music(MUSIC_DIR)
-    if not track_list:
-        print("No music files found in {}".format(MUSIC_DIR))
-        return
-    # Initialize components
-    init_mpd()
-    init_oled()
-    # Setup GPIO buttons
-    GPIO.setmode(GPIO.BOARD)
-    for cb_name, pin in BUTTON_PINS.items():
-        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.add_event_detect(BUTTON_PINS['play_pause'], GPIO.FALLING, callback=button_play_pause, bouncetime=200)
-    GPIO.add_event_detect(BUTTON_PINS['rewind'], GPIO.FALLING, callback=button_rewind, bouncetime=200)
-    GPIO.add_event_detect(BUTTON_PINS['forward'], GPIO.FALLING, callback=button_forward, bouncetime=200)
-    # Handle exit signals
-    signal.signal(signal.SIGINT, cleanup)
-    signal.signal(signal.SIGTERM, cleanup)
-    # Initial display
-    update_display()
-    # Keep running
-    while True:
-        time.sleep(1)
+    try:
+        init_mpd()
+        init_oled()
+        init_gpio()
+        update_oled()
+        # keep alive
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        GPIO.cleanup()
+        if client:
+            client.close()
+            client.disconnect()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
