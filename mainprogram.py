@@ -52,26 +52,45 @@ class MPDController:
 
     def initialize_playlist(self):
         try:
+            # Clear current state
             self.client.clear()
-            self.client.update()
-            logger.debug("Waiting for database update...")
-            time.sleep(2)  # Allow time for database update
-            
-            if self.playlist_name in self.client.listplaylists():
+            logger.debug("Cleared current playlist")
+
+            # Check for existing stored playlist
+            stored_playlists = self.client.listplaylists()
+            logger.debug(f"Found stored playlists: {stored_playlists}")
+
+            # Delete existing playlist if present
+            if any(p['playlist'] == self.playlist_name for p in stored_playlists):
+                logger.info(f"Removing existing playlist: {self.playlist_name}")
                 self.client.rm(self.playlist_name)
-                logger.debug("Removed existing playlist")
-                
+
+            # Update database and wait
+            logger.debug("Starting database update...")
+            self.client.update()
+            while True:
+                status = self.client.status()
+                if 'updating_db' not in status:
+                    break
+                logger.debug("Database update in progress...")
+                time.sleep(1)
+
+            # Create new playlist
+            logger.debug("Adding files to playlist")
             self.client.add("/")
             self.client.save(self.playlist_name)
-            logger.info("Created new playlist with all tracks")
-            
+            logger.info(f"Created new playlist: {self.playlist_name}")
+
+            # Load and start playback
             self.client.load(self.playlist_name)
             self.client.play(0)
             self.client.pause()
+            logger.debug("Playback initialized in paused state")
+
         except Exception as e:
             logger.error(f"Playlist initialization failed: {e}")
             raise
-
+            
 class DisplayManager:
     def __init__(self):
         self.serial = i2c(port=1, address=I2C_ADDRESS)
@@ -85,16 +104,19 @@ class DisplayManager:
     def create_frame(self, track_num, total_tracks, state, progress=0):
         img = Image.new("1", self.device.size)
         draw = ImageDraw.Draw(img)
-        
-        # Track number display
+    
+    # Track number display
         track_str = f"{track_num:02d}"
         bbox = draw.textbbox((0,0), track_str, font=self.fonts['track'])
         track_w = bbox[2] - bbox[0]
+        track_h = bbox[3] - bbox[1]
         track_pos = (
             (self.device.width - track_w) // 2,
-            DISPLAY_CONFIG['padding']
+            (self.device.height - track_h) // 2
         )
         draw.text(track_pos, track_str, font=self.fonts['track'], fill=255)
+    
+    # ... rest of the display code ...
         
         # Track count
         count_str = f"{track_num}/{total_tracks}"
