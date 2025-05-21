@@ -49,26 +49,37 @@ def init_oled():
     font   = ImageFont.truetype(FONT_PATH, FONT_SIZE)
 
 def get_status():
-    st = client.status()
-    return st.get("state", "stop"), int(st.get("song", 0)), float(st.get("elapsed", 0))
+    try:
+        st = client.status()
+        print(f"Current status: {st}")
+        return st.get("state", "stop"), int(st.get("song", 0)), float(st.get("elapsed", 0))
+    except Exception as e:
+        print(f"Error getting status: {e}")
+        return "stop", 0, 0.0
 
 def update_oled():
-    state, song_idx, _ = get_status()
+    state, song_idx, elapsed = get_status()
+    print(f"State: {state}, Song Index: {song_idx}, Elapsed: {elapsed:.1f}s")
+    
+    # Verify we're actually getting a valid index
+    if song_idx < 0:
+        print("Warning: Invalid song index received!")
+        return
+        
     track_no = song_idx + 1
-    msg      = "▶" if state == "play" else "⏸"
-    # draw
+    msg = "▶" if state == "play" else "⏸"
+    
+    # Draw logic remains the same
     img = Image.new("1", (oled.width, oled.height))
     draw_local = ImageDraw.Draw(img)
-    # center the number
     w, h = draw_local.textsize(str(track_no), font=font)
     x = (oled.width - w) // 2
     y = (oled.height - FONT_SIZE) // 2
     draw_local.text((x, y), str(track_no), font=font, fill=255)
-    # play/pause icon bottom-right
     draw_local.text((oled.width - FONT_SIZE//2 - 2, oled.height - FONT_SIZE//2 - 2),
                     msg, font=ImageFont.truetype(FONT_PATH, FONT_SIZE//2), fill=255)
     oled.display(img)
-
+    
 def btn_play_pause(channel):
     state, _, _ = get_status()
     if state == "play":
